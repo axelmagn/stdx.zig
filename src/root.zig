@@ -2,3 +2,8 @@
 const std = @import("std");
 
 pub const ncast = @import("ncast.zig");
+pub const mem = @import("mem.zig");
+
+test {
+    std.testing.refAllDeclsRecursive(@This());
+}
