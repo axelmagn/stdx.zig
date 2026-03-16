@@ -21,17 +21,102 @@ pub const BuddyAllocator = struct {
         invalid_min_block_size,
     };
 
+    const BlockState = enum(u1) {
+        free = 0,
+        used = 1,
+
+        fn asBool(self: BlockState) bool {
+            return @intFromEnum(self) > 0;
+        }
+    };
+
+    /// usage tracker for blocks in the allocator
+    /// TODO: replace with max tree
     const BlockTree = struct {
         bits: std.DynamicBitSetUnmanaged,
         min_block_size: usize,
         max_block_size: usize,
 
-        fn isIndexFree(self: *BlockTree, index: usize) bool {
-            return self.bits.isSet(index);
+        /// create a block tree view for a buffer, overlapping the start of the
+        /// buffer.
+        fn viewFromBuffer(buffer: []u8, min_block_size: usize) BlockTree {
+            assert(std.math.isPowerOfTwo(buffer.len));
+            assert(std.math.isPowerOfTwo(min_block_size));
+            assert(std.mem.isAligned(@intFromPtr(buffer.ptr), min_block_size));
+            var bits = std.DynamicBitSetUnmanaged{};
+            assert(std.mem.isAligned(
+                @intFromPtr(buffer.ptr),
+                @alignOf(std.DynamicBitSetUnmanaged.MaskInt),
+            ));
+            bits.masks = @ptrCast(@alignCast(buffer.ptr));
+            bits.bit_length = calcTotalSize(calcTotalDepth(min_block_size, buffer.len));
+            const self = BlockTree{
+                .bits = bits,
+                .min_block_size = min_block_size,
+                .max_block_size = buffer.len,
+            };
+            assert(self.getSizeBytes() <= buffer.len);
+            return self;
         }
 
-        fn setIndexFreeValue(self: *BlockTree, index: usize, value: bool) void {
-            return self.bits.setValue(index, value);
+        test viewFromBuffer {
+            const t = std.testing;
+            // var buf align(64) = [_]u8{0} ** 1024;
+            var buf: [1024]u8 align(64) = undefined;
+            // std.debug.print("type of buf: {s}\n", .{@typeName(@TypeOf(buf))});
+            const block_tree = viewFromBuffer(&buf, 64);
+            try t.expectEqual(@intFromPtr(&buf), @intFromPtr(block_tree.bits.masks));
+            try t.expectEqual(31, block_tree.bits.bit_length);
+        }
+
+        fn isIndexValid(self: *const BlockTree, index: usize) bool {
+            return index < self.getSizeBits();
+        }
+
+        /// check if an index is marked as free
+        fn isFree(self: *const BlockTree, index: usize) bool {
+            return !self.bits.isSet(index);
+        }
+
+        /// set the free value for an index
+        fn setIndex(self: *BlockTree, index: usize, value: BlockState) void {
+            self.bits.setValue(index, value.asBool());
+        }
+
+        /// set the free value for a range
+        fn setRange(self: *BlockTree, start_index: usize, end_index: usize, value: BlockState) void {
+            const range = std.bit_set.Range{ .start = start_index, .end = end_index };
+            self.bits.setRangeValue(range, value.asBool());
+        }
+
+        /// set the free value for all bits
+        fn setAll(self: *BlockTree, value: BlockState) void {
+            if (value.asBool()) {
+                self.bits.setAll();
+            } else {
+                self.bits.unsetAll();
+            }
+        }
+
+        fn getSizeBits(self: *const BlockTree) usize {
+            return self.bits.bit_length;
+        }
+
+        fn getSizeBytes(self: *const BlockTree) usize {
+            var bytes = @divTrunc(self.bits.bit_length, 8);
+            const rem = @mod(self.bits.bit_length, 8);
+            if (rem > 0) {
+                bytes += 1;
+            }
+            return bytes;
+        }
+
+        fn getTotalDepth(self: *const BlockTree) usize {
+            return calcTotalDepth(self.min_block_size, self.max_block_size);
+        }
+
+        fn getIndexOffset(self: *const BlockTree, index: usize) usize {
+            return BlockTree.calcIndexOffset(index, self.max_block_size);
         }
 
         // ------------------------------------------------------------
@@ -219,6 +304,59 @@ pub const BuddyAllocator = struct {
             try t.expectEqual(8, calcRightChildIndex(3));
             try t.expectEqual(10, calcRightChildIndex(4));
         }
+
+        fn calcIndexDepth(index: usize) usize {
+            if (index == 0) return 0;
+            return @bitSizeOf(usize) - 1 - @clz(index + 1);
+        }
+
+        test calcIndexDepth {
+            const t = std.testing;
+
+            try t.expectEqual(0, calcIndexDepth(0));
+
+            try t.expectEqual(1, calcIndexDepth(1));
+            try t.expectEqual(1, calcIndexDepth(2));
+
+            try t.expectEqual(2, calcIndexDepth(3));
+            try t.expectEqual(2, calcIndexDepth(4));
+            try t.expectEqual(2, calcIndexDepth(5));
+            try t.expectEqual(2, calcIndexDepth(6));
+
+            try t.expectEqual(3, calcIndexDepth(7));
+            try t.expectEqual(3, calcIndexDepth(8));
+            try t.expectEqual(3, calcIndexDepth(9));
+            try t.expectEqual(3, calcIndexDepth(10));
+            try t.expectEqual(3, calcIndexDepth(11));
+            try t.expectEqual(3, calcIndexDepth(12));
+            try t.expectEqual(3, calcIndexDepth(13));
+            try t.expectEqual(3, calcIndexDepth(14));
+        }
+
+        fn calcIndexOffset(index: usize, max_block_size: usize) usize {
+            const depth = calcIndexDepth(index);
+            const depth_start_index = calcDepthStartIndex(depth);
+            assert(depth_start_index <= index);
+            const local_index = index - depth_start_index;
+            assert(std.math.isPowerOfTwo(max_block_size));
+            const block_size = std.math.shr(usize, max_block_size, depth);
+            assert(block_size <= max_block_size);
+            return local_index * block_size;
+        }
+
+        test calcIndexOffset {
+            const t = std.testing;
+
+            try t.expectEqual(0, calcIndexOffset(0, 1024));
+
+            try t.expectEqual(0, calcIndexOffset(1, 1024));
+            try t.expectEqual(512, calcIndexOffset(2, 1024));
+
+            try t.expectEqual(0, calcIndexOffset(3, 1024));
+            try t.expectEqual(256, calcIndexOffset(4, 1024));
+            try t.expectEqual(512, calcIndexOffset(5, 1024));
+            try t.expectEqual(768, calcIndexOffset(6, 1024));
+        }
     };
 
     // ------------------------------------------------------------
@@ -237,172 +375,113 @@ pub const BuddyAllocator = struct {
         // buffer is aligned to block size
         if (!std.mem.isAligned(@intFromPtr(buffer.ptr), options.block_size)) return error.invalid_buffer_align;
 
-        const out = BuddyAllocator{
+        var out = BuddyAllocator{
             .buffer = buffer,
             .min_block_size = options.block_size,
         };
 
-        var free_list = out.getFreeList();
-        assert(@intFromPtr(free_list.masks) == @intFromPtr(buffer.ptr));
-        free_list.setAll();
+        // initialize the block tree
+        var block_tree = out.getBlockTree();
+        block_tree.setAll(.free);
 
-        // TODO: allocate the block of the free list
+        // alloc the block tree post-hoc
+        const block_tree_ptr = out.alloc(
+            block_tree.getSizeBytes(),
+            .fromByteUnits(options.block_size),
+            @returnAddress(),
+        ) catch |err| panic("unexpected error: {any}", .{err});
+        assert(@intFromPtr(block_tree_ptr) == @intFromPtr(block_tree.bits.masks));
 
         return out;
     }
 
+    test init {
+        const t = std.testing;
+        var buf: [1024]u8 align(64) = undefined;
+        const buddy = try BuddyAllocator.init(&buf, .{ .block_size = 64 });
+        try t.expectEqual(&buf, buddy.buffer.ptr);
+        try t.expectEqual(64, buddy.min_block_size);
+    }
+
     pub fn alloc(self: *BuddyAllocator, len: usize, alignment: std.mem.Alignment, ret_addr: usize) error{out_of_memory}![*]u8 {
+        // pub fn alloc(self: *BuddyAllocator, _: usize, _: std.mem.Alignment, ret_addr: usize) error{out_of_memory}![*]u8 {
         _ = ret_addr;
 
         const size = @max(len, alignment.toByteUnits());
-        const target_level = getLevelForSize(size, self.min_block_size, self.buffer.len);
+        const target_depth = BlockTree.calcBlockDepth(size, self.min_block_size, self.buffer.len);
 
-        // find the start and end indices for this level
-        const one: usize = 1;
-        const start_index = std.math.shl(usize, one, target_level) - one;
-        const end_index = std.math.shl(usize, one, target_level + one) - one;
+        const start_index = BlockTree.calcDepthStartIndex(target_depth);
+        const end_index = BlockTree.calcDepthEndIndex(target_depth);
+
+        var block_tree = self.getBlockTree();
+
         var found_index_opt: ?usize = null;
         for (start_index..end_index) |i| {
-            if (self.isFreeBit(i)) {
+            if (block_tree.isFree(i)) {
                 found_index_opt = i;
                 break;
             }
         }
         if (found_index_opt == null) return error.out_of_memory;
 
+        // TODO: move set block logic to block tree so that it can be reused in
+        // free
+
         // mark found index and all parents as used
         const found_index = found_index_opt.?;
         var curr_index = found_index;
         while (curr_index >= 0) {
-            self.setFreeBit(curr_index, false);
-            curr_index = @divTrunc(curr_index - 1, 2);
+            block_tree.setIndex(curr_index, .used);
+            if (curr_index == 0) break;
+
+            const parent_index = BlockTree.calcParentIndex(curr_index);
+            assert(parent_index < curr_index);
+            curr_index = parent_index;
         }
 
-        // TODO:mark all children of found index as used
-        // const max_level = getLevelForSize(self.block_size, self.block_size, self.buffer.len);
-        // const curr_level = target_level;
-        // const child_start_index = found_index;
-        // const child_end_index = found_index + 1;
+        // mark all children of found index as used
+        var left_child_index = BlockTree.calcLeftChildIndex(found_index);
+        assert(left_child_index > found_index);
+        var right_child_index = BlockTree.calcRightChildIndex(found_index);
+        assert(right_child_index > found_index);
 
-        // TODO: return ptr
+        while (block_tree.isIndexValid(left_child_index)) {
+            assert(block_tree.isIndexValid(right_child_index));
+            assert(right_child_index > left_child_index);
+            block_tree.setRange(left_child_index, right_child_index + 1, .used);
+            left_child_index = BlockTree.calcLeftChildIndex(left_child_index);
+            right_child_index = BlockTree.calcRightChildIndex(right_child_index);
+        }
+
+        const found_offset = block_tree.getIndexOffset(found_index);
+        return self.buffer.ptr + found_offset;
     }
+
+    test alloc {
+        const t = std.testing;
+        var buf: [1024]u8 align(64) = undefined;
+        const buf_start = @intFromPtr(&buf);
+        var buddy = try BuddyAllocator.init(&buf, .{ .block_size = 64 });
+        const p1 = try buddy.alloc(8, .fromByteUnits(8), @returnAddress());
+        try t.expectEqual(64, @intFromPtr(p1) - buf_start);
+        const p2 = try buddy.alloc(168, .fromByteUnits(4), @returnAddress());
+        try t.expectEqual(256, @intFromPtr(p2) - buf_start);
+        const p3 = try buddy.alloc(64, .fromByteUnits(4), @returnAddress());
+        try t.expectEqual(128, @intFromPtr(p3) - buf_start);
+    }
+
+    // pub fn free(self: *BuddyAllocator, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    //     const size = @max(memory.len, alignment.toByteUnits());
+    //     const depth = BlockTree.calcBlockDepth(size, self.min_block_size, self.buffer.len);
+    //
+    // }
 
     // ------------------------------------------------------------
-    // block tree functions
+    // TODO: section name
     // ------------------------------------------------------------
 
-    /// Get the free bitset at the start of the buffer.
-    fn getFreeList(self: *const BuddyAllocator) std.DynamicBitSetUnmanaged {
-        // TODO: caching
-        var free_set = std.DynamicBitSetUnmanaged{};
-        free_set.masks = @ptrCast(@alignCast(self.buffer.ptr));
-        free_set.bit_length = getFreeListBitLength(self.buffer.len, self.min_block_size);
-        return free_set;
-    }
-
-    test getFreeList {
-        const t = std.testing;
-        var buf: [1024]u8 = undefined;
-        const buddy = BuddyAllocator{
-            .buffer = &buf,
-            .min_block_size = 64,
-        };
-        const free_list = buddy.getFreeList();
-        try t.expectEqual(@intFromPtr(&buf), @intFromPtr(free_list.masks));
-        try t.expectEqual(31, free_list.bit_length);
-    }
-
-    /// calculate the size of the free list in bits
-    fn getFreeListBitLength(len: usize, min_block_size: usize) usize {
-        var block_size = len;
-        var bits_needed: usize = 0;
-        while (block_size >= min_block_size) {
-            bits_needed += @divExact(len, block_size);
-            // divide by 2
-            block_size >>= 1;
-        }
-        return bits_needed;
-    }
-
-    test getFreeListBitLength {
-        const t = std.testing;
-        try t.expectEqual(31, getFreeListBitLength(1024, 64));
-    }
-
-    fn getRequiredBlockSize(requested_size: usize, min_block_size: usize) usize {
-        var block_size = min_block_size;
-        while (block_size < requested_size) {
-            block_size <<= 1;
-        }
-        return block_size;
-    }
-
-    test getRequiredBlockSize {
-        const t = std.testing;
-        try t.expectEqual(64, getRequiredBlockSize(31, 64));
-        try t.expectEqual(64, getRequiredBlockSize(64, 64));
-        try t.expectEqual(128, getRequiredBlockSize(78, 64));
-        try t.expectEqual(256, getRequiredBlockSize(129, 64));
-    }
-
-    fn getLevelForSize(requested_size: usize, min_block_size: usize, max_block_size: usize) usize {
-        // TODO: replace O(n) loops with clz and bsr instructions
-        assert(min_block_size > 0);
-        assert(max_block_size >= min_block_size);
-        const block_size = getRequiredBlockSize(requested_size, min_block_size);
-        assert(block_size >= min_block_size);
-
-        var current_size = max_block_size;
-        var level: usize = 0;
-
-        while (current_size > block_size) {
-            current_size >>= 1;
-            level += 1;
-        }
-
-        assert(current_size == block_size);
-
-        return level;
-    }
-
-    test getLevelForSize {
-        const t = std.testing;
-        try t.expectEqual(0, getLevelForSize(1024, 64, 1024));
-        try t.expectEqual(0, getLevelForSize(1000, 64, 1024));
-        try t.expectEqual(0, getLevelForSize(800, 64, 1024));
-        try t.expectEqual(1, getLevelForSize(512, 64, 1024));
-        try t.expectEqual(1, getLevelForSize(500, 64, 1024));
-        try t.expectEqual(1, getLevelForSize(400, 64, 1024));
-        try t.expectEqual(2, getLevelForSize(256, 64, 1024));
-        try t.expectEqual(2, getLevelForSize(200, 64, 1024));
-        try t.expectEqual(2, getLevelForSize(150, 64, 1024));
-        try t.expectEqual(3, getLevelForSize(128, 64, 1024));
-        try t.expectEqual(3, getLevelForSize(100, 64, 1024));
-        try t.expectEqual(4, getLevelForSize(64, 64, 1024));
-        try t.expectEqual(4, getLevelForSize(32, 64, 1024));
-        try t.expectEqual(4, getLevelForSize(16, 64, 1024));
-        try t.expectEqual(4, getLevelForSize(8, 64, 1024));
-    }
-
-    fn getSizeForLevel(level: usize, max_block_size: usize) usize {
-        return std.math.shr(usize, max_block_size, level);
-    }
-
-    test getSizeForLevel {
-        const t = std.testing;
-        try t.expectEqual(1024, getSizeForLevel(0, 1024));
-        try t.expectEqual(512, getSizeForLevel(1, 1024));
-        try t.expectEqual(256, getSizeForLevel(2, 1024));
-        try t.expectEqual(128, getSizeForLevel(3, 1024));
-    }
-
-    fn isFreeBit(self: *BuddyAllocator, index: usize) bool {
-        return self.getFreeList().isSet(index);
-    }
-
-    fn setFreeBit(self: *BuddyAllocator, index: usize, is_free: bool) void {
-        var free_list = self.getFreeList();
-        free_list.setValue(index, is_free);
+    fn getBlockTree(self: *const BuddyAllocator) BlockTree {
+        return .viewFromBuffer(self.buffer, self.min_block_size);
     }
 };
 
