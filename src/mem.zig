@@ -122,10 +122,10 @@ pub const BuddyAllocator = struct {
             return BlockTree.calcIndexOffset(index, self.max_block_size);
         }
 
-        fn getOffsetIndex(self: *const BlockTree, offset: usize, size: usize) usize {
+        fn getOffsetIndex(self: *const BlockTree, offset: usize, block_size: usize) usize {
             return BlockTree.calcOffsetIndex(
                 offset,
-                size,
+                block_size,
                 self.min_block_size,
                 self.max_block_size,
             );
@@ -583,7 +583,6 @@ pub const BuddyAllocator = struct {
     }
 
     pub fn alloc(self: *BuddyAllocator, len: usize, alignment: std.mem.Alignment, ret_addr: usize) error{out_of_memory}![*]u8 {
-        // pub fn alloc(self: *BuddyAllocator, _: usize, _: std.mem.Alignment, ret_addr: usize) error{out_of_memory}![*]u8 {
         _ = ret_addr;
 
         assert(std.math.isPowerOfTwo(alignment.toByteUnits()));
@@ -599,8 +598,12 @@ pub const BuddyAllocator = struct {
         var found_index_opt: ?usize = null;
         for (start_index..end_index) |i| {
             if (block_tree.isFree(i)) {
-                found_index_opt = i;
-                break;
+                const offset = block_tree.getIndexOffset(i);
+                const ptr = self.buffer.ptr + offset;
+                if (alignment.check(@intFromPtr(ptr))) {
+                    found_index_opt = i;
+                    break;
+                }
             }
         }
         if (found_index_opt == null) return error.out_of_memory;
