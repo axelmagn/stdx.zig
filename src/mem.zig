@@ -119,11 +119,22 @@ pub const BuddyAllocator = struct {
             return BlockTree.calcIndexOffset(index, self.max_block_size);
         }
 
+        fn getOffsetIndex(self: *const BlockTree, offset: usize, size: usize) usize {
+            return BlockTree.calcOffsetIndex(
+                offset,
+                size,
+                self.min_block_size,
+                self.max_block_size,
+            );
+        }
+
         fn markBlockAsUsed(self: *BlockTree, index: usize) void {
-            assert(index < self.getSizeBits());
+            assert(self.isIndexValid(index));
             // mark index and all parents as used
-            var curr_index = index;
-            while (curr_index >= 0) {
+            var curr_index: usize = index;
+            while (true) {
+                // stop early for parents already in use
+                if (!self.isFree(curr_index)) break;
                 self.setIndex(curr_index, .used);
                 if (curr_index == 0) break;
 
@@ -132,22 +143,113 @@ pub const BuddyAllocator = struct {
                 curr_index = parent_index;
             }
             // mark chilren as used
-            var left_child_index = BlockTree.calcLeftChildIndex(index);
+            var left_child_index = calcLeftChildIndex(index);
             assert(left_child_index > index);
-            var right_child_index = BlockTree.calcRightChildIndex(index);
+            var right_child_index = calcRightChildIndex(index);
             assert(right_child_index > index);
 
             while (self.isIndexValid(left_child_index)) {
                 assert(self.isIndexValid(right_child_index));
                 assert(right_child_index > left_child_index);
                 self.setRange(left_child_index, right_child_index + 1, .used);
-                left_child_index = BlockTree.calcLeftChildIndex(left_child_index);
-                right_child_index = BlockTree.calcRightChildIndex(right_child_index);
+                left_child_index = calcLeftChildIndex(left_child_index);
+                right_child_index = calcRightChildIndex(right_child_index);
             }
         }
 
         fn markBlockAsFree(self: *BlockTree, index: usize) void {
-            assert(index < self.getSizeBits());
+            assert(self.isIndexValid(index));
+
+            // mark index as free
+            self.setIndex(index, .free);
+
+            // mark chilren as free
+            var left_child_index = calcLeftChildIndex(index);
+            assert(left_child_index > index);
+            var right_child_index = calcRightChildIndex(index);
+            assert(right_child_index > index);
+
+            while (self.isIndexValid(left_child_index)) {
+                assert(self.isIndexValid(right_child_index));
+                assert(right_child_index > left_child_index);
+                self.setRange(left_child_index, right_child_index + 1, .free);
+                left_child_index = calcLeftChildIndex(left_child_index);
+                right_child_index = calcRightChildIndex(right_child_index);
+            }
+
+            // mark index and parents as free
+            if (index == 0) return;
+            var curr_index = calcParentIndex(index);
+            assert(self.isIndexValid(curr_index));
+            while (true) : (curr_index = calcParentIndex(curr_index)) {
+                left_child_index = calcLeftChildIndex(curr_index);
+                assert(self.isIndexValid(left_child_index));
+                right_child_index = calcRightChildIndex(curr_index);
+                assert(self.isIndexValid(right_child_index));
+                if (!self.isFree(left_child_index) or
+                    !self.isFree(right_child_index)) break;
+                self.setIndex(curr_index, .free);
+                if (curr_index == 0) break;
+            }
+        }
+
+        test "markBlockAsUsed and markBlockAsFree" {
+            const t = std.testing;
+            var buf: [1024]u8 align(64) = [_]u8{0} ** 1024;
+            var block_tree = viewFromBuffer(&buf, 64);
+
+            try t.expect(block_tree.isFree(3));
+
+            block_tree.markBlockAsUsed(3);
+
+            try t.expect(!block_tree.isFree(0));
+
+            try t.expect(!block_tree.isFree(1));
+            try t.expect(block_tree.isFree(2));
+
+            try t.expect(!block_tree.isFree(3));
+            try t.expect(block_tree.isFree(4));
+            try t.expect(block_tree.isFree(5));
+            try t.expect(block_tree.isFree(6));
+
+            try t.expect(!block_tree.isFree(7));
+            try t.expect(!block_tree.isFree(8));
+            try t.expect(block_tree.isFree(9));
+            try t.expect(block_tree.isFree(10));
+
+            block_tree.markBlockAsUsed(5);
+
+            try t.expect(!block_tree.isFree(0));
+
+            try t.expect(!block_tree.isFree(1));
+            try t.expect(!block_tree.isFree(2));
+
+            try t.expect(!block_tree.isFree(3));
+            try t.expect(block_tree.isFree(4));
+            try t.expect(!block_tree.isFree(5));
+            try t.expect(block_tree.isFree(6));
+
+            try t.expect(!block_tree.isFree(7));
+            try t.expect(!block_tree.isFree(8));
+            try t.expect(block_tree.isFree(9));
+            try t.expect(block_tree.isFree(10));
+
+            block_tree.markBlockAsFree(3);
+
+            try t.expect(!block_tree.isFree(0));
+
+            try t.expect(block_tree.isFree(1));
+            try t.expect(!block_tree.isFree(2));
+
+            try t.expect(block_tree.isFree(3));
+            try t.expect(block_tree.isFree(4));
+            try t.expect(!block_tree.isFree(5));
+            try t.expect(block_tree.isFree(6));
+
+            try t.expect(block_tree.isFree(7));
+            try t.expect(block_tree.isFree(8));
+            try t.expect(block_tree.isFree(9));
+            try t.expect(block_tree.isFree(10));
         }
 
         // ------------------------------------------------------------
@@ -388,6 +490,20 @@ pub const BuddyAllocator = struct {
             try t.expectEqual(512, calcIndexOffset(5, 1024));
             try t.expectEqual(768, calcIndexOffset(6, 1024));
         }
+
+        fn calcOffsetIndex(
+            offset: usize,
+            size: usize,
+            min_block_size: usize,
+            max_block_size: usize,
+        ) usize {
+            const block_size = calcBlockSize(size, min_block_size);
+            assert(std.math.isPowerOfTwo(block_size));
+            const depth = calcBlockDepth(size, min_block_size, max_block_size);
+            const start_index = calcDepthStartIndex(depth);
+            const index_offset = @divExact(offset, block_size);
+            return start_index + index_offset;
+        }
     };
 
     // ------------------------------------------------------------
@@ -455,35 +571,9 @@ pub const BuddyAllocator = struct {
         }
         if (found_index_opt == null) return error.out_of_memory;
 
-        // TODO: move set block logic to block tree so that it can be reused in
-        // free
-
-        // mark found index and all parents as used
+        // mark found index as used
         const found_index = found_index_opt.?;
-        var curr_index = found_index;
-        while (curr_index >= 0) {
-            block_tree.setIndex(curr_index, .used);
-            if (curr_index == 0) break;
-
-            const parent_index = BlockTree.calcParentIndex(curr_index);
-            assert(parent_index < curr_index);
-            curr_index = parent_index;
-        }
-
-        // mark all children of found index as used
-        var left_child_index = BlockTree.calcLeftChildIndex(found_index);
-        assert(left_child_index > found_index);
-        var right_child_index = BlockTree.calcRightChildIndex(found_index);
-        assert(right_child_index > found_index);
-
-        while (block_tree.isIndexValid(left_child_index)) {
-            assert(block_tree.isIndexValid(right_child_index));
-            assert(right_child_index > left_child_index);
-            block_tree.setRange(left_child_index, right_child_index + 1, .used);
-            left_child_index = BlockTree.calcLeftChildIndex(left_child_index);
-            right_child_index = BlockTree.calcRightChildIndex(right_child_index);
-        }
-
+        block_tree.markBlockAsUsed(found_index);
         const found_offset = block_tree.getIndexOffset(found_index);
         return self.buffer.ptr + found_offset;
     }
@@ -501,6 +591,96 @@ pub const BuddyAllocator = struct {
         try t.expectEqual(128, @intFromPtr(p3) - buf_start);
     }
 
+    pub fn resize(
+        self: *BuddyAllocator,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        _ = ret_addr;
+        // TODO: fail assertions gracefully and check for other invalid input
+        assert(@intFromPtr(self.buffer.ptr) <= @intFromPtr(memory.ptr));
+        const offset: usize = memory.ptr - self.buffer.ptr;
+        const curr_size = @max(memory.len, alignment.toByteUnits());
+        const curr_block_size = BlockTree.calcBlockSize(curr_size, self.min_block_size);
+        const new_size = @max(new_len, alignment.toByteUnits());
+        const new_block_size = BlockTree.calcBlockSize(new_size, self.min_block_size);
+        if (curr_block_size == new_block_size) return true;
+        if (curr_block_size > new_block_size) {
+            return self.resizeGrow(offset, curr_block_size, new_block_size);
+        } else {
+            assert(curr_block_size < new_block_size);
+            return self.resizeShrink(offset, curr_block_size, new_block_size);
+        }
+    }
+
+    fn resizeGrow(
+        self: *BuddyAllocator,
+        offset: usize,
+        curr_block_size: usize,
+        new_block_size: usize,
+    ) bool {
+        assert(new_block_size > curr_block_size);
+        assert(std.math.isPowerOfTwo(curr_block_size));
+        assert(std.math.isPowerOfTwo(new_block_size));
+
+        var block_tree = self.getBlockTree();
+        const strides = @divExact(new_block_size, curr_block_size);
+        const index = block_tree.getOffsetIndex(offset, curr_block_size);
+        assert(block_tree.isIndexValid(index));
+        const depth = BlockTree.calcIndexDepth(index);
+        const depth_end_index = BlockTree.calcDepthEndIndex(depth);
+        if (index + strides > depth_end_index) return false;
+
+        // check if we can grow
+        for (1..strides) |i| {
+            const curr_index = index + i;
+            assert(block_tree.isIndexValid(curr_index));
+            if (!block_tree.isFree(curr_index)) return false;
+        }
+
+        // if so, mark all necessary blocks as used
+        for (1..strides) |i| {
+            const curr_index = index + i;
+            assert(block_tree.isIndexValid(curr_index));
+            assert(block_tree.isFree(curr_index));
+            block_tree.markBlockAsUsed(curr_index);
+        }
+
+        return true;
+    }
+
+    fn resizeShrink(
+        self: *BuddyAllocator,
+        offset: usize,
+        curr_block_size: usize,
+        new_block_size: usize,
+    ) bool {
+        assert(new_block_size < curr_block_size);
+        assert(std.math.isPowerOfTwo(curr_block_size));
+        assert(std.math.isPowerOfTwo(new_block_size));
+
+        var block_tree = self.getBlockTree();
+        var block_size = curr_block_size;
+        var index = block_tree.getOffsetIndex(offset, block_size);
+        assert(block_tree.isIndexValid(index));
+
+        // free right children until appropriately sized
+        while (block_size > new_block_size) {
+            const left_child_index = BlockTree.calcLeftChildIndex(index);
+            assert(block_tree.isIndexValid(left_child_index));
+            const right_child_index = BlockTree.calcRightChildIndex(index);
+            assert(block_tree.isIndexValid(right_child_index));
+
+            block_tree.markBlockAsFree(right_child_index);
+
+            block_size >>= 1;
+            index = left_child_index;
+        }
+        return true;
+    }
+
     pub fn free(
         self: *BuddyAllocator,
         memory: []u8,
@@ -509,8 +689,35 @@ pub const BuddyAllocator = struct {
     ) void {
         _ = ret_addr;
 
+        // NOTE: by convention, free functions fail silently on invalid input
+        // TODO: fail assertions silently
+        assert(@intFromPtr(self.buffer.ptr) <= @intFromPtr(memory.ptr));
+        const offset: usize = memory.ptr - self.buffer.ptr;
+
+        var block_tree = self.getBlockTree();
         const size = @max(memory.len, alignment.toByteUnits());
-        const depth = BlockTree.calcBlockDepth(size, self.min_block_size, self.buffer.len);
+        const index = block_tree.getOffsetIndex(offset, size);
+        assert(block_tree.isIndexValid(index));
+        block_tree.markBlockAsFree(index);
+    }
+
+    test free {
+        const t = std.testing;
+        var buf: [1024]u8 align(64) = undefined;
+        const buf_start = @intFromPtr(&buf);
+        var buddy = try BuddyAllocator.init(&buf, .{ .block_size = 64 });
+
+        const p1 = try buddy.alloc(8, .fromByteUnits(8), @returnAddress());
+        try t.expectEqual(64, @intFromPtr(p1) - buf_start);
+        const p2 = try buddy.alloc(168, .fromByteUnits(4), @returnAddress());
+        try t.expectEqual(256, @intFromPtr(p2) - buf_start);
+        const p3 = try buddy.alloc(64, .fromByteUnits(4), @returnAddress());
+        try t.expectEqual(128, @intFromPtr(p3) - buf_start);
+
+        buddy.free(p1[0..8], .fromByteUnits(8), @returnAddress());
+
+        const p4 = try buddy.alloc(8, .fromByteUnits(8), @returnAddress());
+        try t.expectEqual(64, @intFromPtr(p4) - buf_start);
     }
 
     // ------------------------------------------------------------
