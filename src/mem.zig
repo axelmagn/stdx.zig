@@ -119,6 +119,37 @@ pub const BuddyAllocator = struct {
             return BlockTree.calcIndexOffset(index, self.max_block_size);
         }
 
+        fn markBlockAsUsed(self: *BlockTree, index: usize) void {
+            assert(index < self.getSizeBits());
+            // mark index and all parents as used
+            var curr_index = index;
+            while (curr_index >= 0) {
+                self.setIndex(curr_index, .used);
+                if (curr_index == 0) break;
+
+                const parent_index = calcParentIndex(curr_index);
+                assert(parent_index < curr_index);
+                curr_index = parent_index;
+            }
+            // mark chilren as used
+            var left_child_index = BlockTree.calcLeftChildIndex(index);
+            assert(left_child_index > index);
+            var right_child_index = BlockTree.calcRightChildIndex(index);
+            assert(right_child_index > index);
+
+            while (self.isIndexValid(left_child_index)) {
+                assert(self.isIndexValid(right_child_index));
+                assert(right_child_index > left_child_index);
+                self.setRange(left_child_index, right_child_index + 1, .used);
+                left_child_index = BlockTree.calcLeftChildIndex(left_child_index);
+                right_child_index = BlockTree.calcRightChildIndex(right_child_index);
+            }
+        }
+
+        fn markBlockAsFree(self: *BlockTree, index: usize) void {
+            assert(index < self.getSizeBits());
+        }
+
         // ------------------------------------------------------------
         // tree math
         // ------------------------------------------------------------
@@ -470,11 +501,17 @@ pub const BuddyAllocator = struct {
         try t.expectEqual(128, @intFromPtr(p3) - buf_start);
     }
 
-    // pub fn free(self: *BuddyAllocator, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-    //     const size = @max(memory.len, alignment.toByteUnits());
-    //     const depth = BlockTree.calcBlockDepth(size, self.min_block_size, self.buffer.len);
-    //
-    // }
+    pub fn free(
+        self: *BuddyAllocator,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        _ = ret_addr;
+
+        const size = @max(memory.len, alignment.toByteUnits());
+        const depth = BlockTree.calcBlockDepth(size, self.min_block_size, self.buffer.len);
+    }
 
     // ------------------------------------------------------------
     // TODO: section name
