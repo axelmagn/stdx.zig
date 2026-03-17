@@ -6,6 +6,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 const panic = std.debug.panic;
 
+const test_buddy_allocator_memory_size = (1 << 20) * @sizeOf(u64);
+var test_buddy_allocator_memory: [test_buddy_allocator_memory_size]u8 align(test_buddy_allocator_memory_size) = undefined;
+
 pub const BuddyAllocatorOptions = struct {
     // by default, align to CPU cache
     block_size: usize = std.atomic.cache_line,
@@ -550,9 +553,40 @@ pub const BuddyAllocator = struct {
         try t.expectEqual(64, buddy.min_block_size);
     }
 
+    pub fn allocator(self: *BuddyAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocOpaque,
+                .resize = resizeOpaque,
+                .remap = remapOpaque,
+                .free = freeOpaque,
+            },
+        };
+    }
+
+    test allocator {
+        var buddy = std.mem.validationWrap(
+            try BuddyAllocator.init(test_buddy_allocator_memory[0..], .{}),
+        );
+        const a = buddy.allocator();
+
+        try std.heap.testAllocator(a);
+        try std.heap.testAllocatorAligned(a);
+        try std.heap.testAllocatorLargeAlignment(a);
+        try std.heap.testAllocatorAlignedShrink(a);
+    }
+
+    pub fn allocOpaque(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BuddyAllocator = @ptrCast(@alignCast(ctx));
+        return self.alloc(len, alignment, ret_addr) catch null;
+    }
+
     pub fn alloc(self: *BuddyAllocator, len: usize, alignment: std.mem.Alignment, ret_addr: usize) error{out_of_memory}![*]u8 {
         // pub fn alloc(self: *BuddyAllocator, _: usize, _: std.mem.Alignment, ret_addr: usize) error{out_of_memory}![*]u8 {
         _ = ret_addr;
+
+        assert(std.math.isPowerOfTwo(alignment.toByteUnits()));
 
         const size = @max(len, alignment.toByteUnits());
         const target_depth = BlockTree.calcBlockDepth(size, self.min_block_size, self.buffer.len);
@@ -575,7 +609,16 @@ pub const BuddyAllocator = struct {
         const found_index = found_index_opt.?;
         block_tree.markBlockAsUsed(found_index);
         const found_offset = block_tree.getIndexOffset(found_index);
-        return self.buffer.ptr + found_offset;
+        const out = self.buffer.ptr + found_offset;
+        // DEBUG
+        if (!alignment.check(@intFromPtr(out))) {
+            std.debug.print("alignment: {d}\n", .{alignment.toByteUnits()});
+            std.debug.print("block_size: {d}\n", .{BlockTree.calcDepthSize(target_depth, self.buffer.len)});
+            std.debug.print("out: {d}\n", .{@intFromPtr(out)});
+            std.debug.print("out % alignment: {d}\n", .{@mod(@intFromPtr(out), alignment.toByteUnits())});
+        }
+        assert(alignment.check(@intFromPtr(out)));
+        return out;
     }
 
     test alloc {
@@ -589,6 +632,17 @@ pub const BuddyAllocator = struct {
         try t.expectEqual(256, @intFromPtr(p2) - buf_start);
         const p3 = try buddy.alloc(64, .fromByteUnits(4), @returnAddress());
         try t.expectEqual(128, @intFromPtr(p3) - buf_start);
+    }
+
+    pub fn resizeOpaque(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *BuddyAllocator = @ptrCast(@alignCast(ctx));
+        return self.resize(memory, alignment, new_len, ret_addr);
     }
 
     pub fn resize(
@@ -607,12 +661,35 @@ pub const BuddyAllocator = struct {
         const new_size = @max(new_len, alignment.toByteUnits());
         const new_block_size = BlockTree.calcBlockSize(new_size, self.min_block_size);
         if (curr_block_size == new_block_size) return true;
-        if (curr_block_size > new_block_size) {
+        if (curr_block_size < new_block_size) {
             return self.resizeGrow(offset, curr_block_size, new_block_size);
         } else {
-            assert(curr_block_size < new_block_size);
+            assert(curr_block_size > new_block_size);
             return self.resizeShrink(offset, curr_block_size, new_block_size);
         }
+    }
+
+    test resize {
+        const t = std.testing;
+        var buf: [1024]u8 align(64) = undefined;
+        const buf_start = @intFromPtr(&buf);
+        var buddy = try BuddyAllocator.init(&buf, .{ .block_size = 64 });
+        const align_ = std.mem.Alignment.fromByteUnits(8);
+
+        var p1 = try buddy.alloc(58, align_, 0);
+        var b1: []u8 = p1[0..58];
+        try t.expectEqual(64, @intFromPtr(b1.ptr) - buf_start);
+        var p2 = try buddy.alloc(46, align_, 0);
+        var b2: []u8 = p2[0..46];
+        try t.expectEqual(128, @intFromPtr(b2.ptr) - buf_start);
+
+        try t.expect(buddy.resize(b1, align_, 15, 0));
+        b1.len = 15;
+        try t.expect(buddy.resize(b1, align_, 30, 0));
+        b1.len = 30;
+        try t.expect(buddy.resize(b2, align_, 200, 0));
+        b2.len = 200;
+        try t.expect(!buddy.resize(b1, align_, 100, 0));
     }
 
     fn resizeGrow(
@@ -679,6 +756,40 @@ pub const BuddyAllocator = struct {
             index = left_child_index;
         }
         return true;
+    }
+
+    fn remapOpaque(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *BuddyAllocator = @ptrCast(@alignCast(ctx));
+        return self.remap(memory, alignment, new_len, ret_addr);
+    }
+
+    pub fn remap(
+        self: *BuddyAllocator,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        if (self.resize(memory, alignment, new_len, ret_addr)) {
+            return memory.ptr;
+        }
+        return null;
+    }
+
+    pub fn freeOpaque(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *BuddyAllocator = @ptrCast(@alignCast(ctx));
+        self.free(memory, alignment, ret_addr);
     }
 
     pub fn free(
