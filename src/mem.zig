@@ -122,10 +122,10 @@ pub const BuddyAllocator = struct {
             return BlockTree.calcIndexOffset(index, self.max_block_size);
         }
 
-        fn getOffsetIndex(self: *const BlockTree, offset: usize, block_size: usize) usize {
+        fn getOffsetIndex(self: *const BlockTree, offset: usize, size: usize) usize {
             return BlockTree.calcOffsetIndex(
                 offset,
-                block_size,
+                size,
                 self.min_block_size,
                 self.max_block_size,
             );
