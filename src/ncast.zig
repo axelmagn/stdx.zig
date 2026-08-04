@@ -13,13 +13,13 @@ const assert = std.debug.assert;
 ///
 /// does not accept pointers, as their casting path is often ambiguous.
 pub fn ncast(T: type, value: anytype) T {
-    const V = @TypeOf(value);
-    const v_info = @typeInfo(V);
-    const t_info = @typeInfo(T);
-    const comp_err = "cannot ncast types: " ++ @typeName(V) ++ " -> " ++ @typeName(T);
+    const I = @TypeOf(value);
+    const in_info = @typeInfo(I);
+    const out_info = @typeInfo(T);
+    const comp_err = "cannot ncast types: " ++ @typeName(I) ++ " -> " ++ @typeName(T);
 
-    return switch (t_info) {
-        .int => switch (v_info) {
+    return switch (out_info) {
+        .int => switch (in_info) {
             .float, .comptime_float => @intFromFloat(value),
             .bool => @intFromBool(value),
             .@"enum" => @intFromEnum(value),
@@ -27,7 +27,7 @@ pub fn ncast(T: type, value: anytype) T {
             .int, .comptime_int => @intCast(value),
             else => @compileError(comp_err),
         },
-        .float => switch (v_info) {
+        .float => switch (in_info) {
             .int, .comptime_int => @floatFromInt(value),
             .float, .comptime_float => @floatCast(value),
             .bool => @floatFromInt(@intFromBool(value)),
@@ -96,9 +96,15 @@ test ncast {
     try t.expectEqual(@as(i32, 1), ncast(i32, true));
     try t.expectEqual(@as(i32, 0), ncast(i32, false));
 
+    // bool to float
+    try t.expectEqual(@as(f32, 1.0), ncast(f32, true));
+
     // Enum to int
     const Color = enum(u8) { red = 1, green = 2, blue = 3 };
     try t.expectEqual(@as(i32, 2), ncast(i32, Color.green));
+
+    // enum to float
+    try t.expectEqual(@as(f32, 2.0), ncast(f32, Color.green));
 }
 
 test ncast_call {

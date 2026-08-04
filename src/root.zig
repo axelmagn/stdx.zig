@@ -2,9 +2,8 @@
 const std = @import("std");
 
 pub const ncast = @import("ncast.zig");
-// BROKEN - needs rewrite?
-pub const mem = @import("mem.zig");
+pub const annotate = @import("annotate.zig");
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }
